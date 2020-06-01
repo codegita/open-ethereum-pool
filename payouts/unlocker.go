@@ -35,6 +35,13 @@ const byzantiumHardForkHeight = 4370000
 var homesteadReward = math.MustParseBig256("5000000000000000000")
 var byzantiumReward = math.MustParseBig256("3000000000000000000")
 
+// Block reward in wei for successfully mining a block for Valorbit chain
+var ValorbitBlockReward = math.MustParseBig256("5000000000000000000000")
+var DisinflationRateQuotient = big.NewInt(11) // Disinflation rate quotient for ECIP1017
+var DisinflationRateDivisor = big.NewInt(10)  // Disinflation rate divisor for ECIP1017
+var BlockRewardGrowthEras = big.NewInt(12)    // (Dis)inflation runs for this many eras
+var ECIP1017EraRounds = big.NewInt(60000)
+
 // Donate 10% from pool fees to developers
 const donationFee = 10.0
 const donationAccount = "0xb85150eb365e7df0941f0cf08235f987ba91506a"
@@ -210,7 +217,7 @@ func (u *BlockUnlocker) handleBlock(block *rpc.GetBlockReply, candidate *storage
 		return err
 	}
 	candidate.Height = correctHeight
-	reward := getConstReward(candidate.Height)
+	reward, _ := getBaseReward(candidate.Height)
 
 	// Add TX fees
 	extraTxReward, err := u.getExtraRewardForTx(block)
@@ -503,24 +510,35 @@ func weiToShannonInt64(wei *big.Rat) int64 {
 	return value
 }
 
-func getConstReward(height int64) *big.Int {
-	if height >= byzantiumHardForkHeight {
-		return new(big.Int).Set(byzantiumReward)
+func getBaseReward(height int64) (*big.Int, *big.Int) {
+
+	era := GetBlockEra(new(big.Int).SetInt64(height), ECIP1017EraRounds)
+
+	if era.Cmp(BlockRewardGrowthEras) == 1 {
+		era = BlockRewardGrowthEras
 	}
-	return new(big.Int).Set(homesteadReward)
+
+	return GetBlockWinnerRewardByEra(era, ValorbitBlockReward), era
+
 }
 
-func getRewardForUncle(height int64) *big.Int {
-	reward := getConstReward(height)
+func getRewardForUncle(height int64) *big.Int {	
+	reward, _ := getBaseReward(height)
 	return new(big.Int).Div(reward, new(big.Int).SetInt64(32))
 }
 
 func getUncleReward(uHeight, height int64) *big.Int {
-	reward := getConstReward(height)
-	k := height - uHeight
-	reward.Mul(big.NewInt(8-k), reward)
-	reward.Div(reward, big.NewInt(8))
-	return reward
+	reward, era := getBaseReward(height)
+
+	if era.Cmp(big.NewInt(0)) == 0 {
+		k := height - uHeight
+		reward.Mul(big.NewInt(8-k), reward)		
+		reward.Div(reward, big.NewInt(8))
+		return reward	
+	}
+	
+	return new(big.Int).Div(reward, new(big.Int).SetInt64(32))
+
 }
 
 func (u *BlockUnlocker) getExtraRewardForTx(block *rpc.GetBlockReply) (*big.Int, error) {
@@ -539,4 +557,42 @@ func (u *BlockUnlocker) getExtraRewardForTx(block *rpc.GetBlockReply) (*big.Int,
 		}
 	}
 	return amount, nil
+}
+
+// GetBlockWinnerRewardByEra gets a block reward at disinflation rate.
+// Constants MaxBlockReward, DisinflationRateQuotient, and DisinflationRateDivisor assumed.
+func GetBlockWinnerRewardByEra(era *big.Int, blockReward *big.Int) *big.Int {
+	if era.Cmp(big.NewInt(0)) == 0 {
+		return new(big.Int).Set(blockReward)
+	}
+
+	// MaxBlockReward _r_ * (4/5)**era == MaxBlockReward * (4**era) / (5**era)
+	// since (q/d)**n == q**n / d**n
+	// qed
+	var q, d, r *big.Int = new(big.Int), new(big.Int), new(big.Int)
+
+	q.Exp(DisinflationRateQuotient, era, nil)
+	d.Exp(DisinflationRateDivisor, era, nil)
+
+	r.Mul(blockReward, q)
+	r.Div(r, d)
+
+	return r
+}
+
+// GetBlockEra gets which "Era" a given block is within, given an era length (ecip-1017 has era=5,000,000 blocks)
+// Returns a zero-index era number, so "Era 1": 0, "Era 2": 1, "Era 3": 2 ...
+func GetBlockEra(blockNum, eraLength *big.Int) *big.Int {
+	// If genesis block or impossible negative-numbered block, return zero-val.
+	if blockNum.Sign() < 1 {
+		return new(big.Int)
+	}
+
+	remainder := big.NewInt(0).Mod(big.NewInt(0).Sub(blockNum, big.NewInt(1)), eraLength)
+	base := big.NewInt(0).Sub(blockNum, remainder)
+
+	d := big.NewInt(0).Div(base, eraLength)
+	dremainder := big.NewInt(0).Mod(d, big.NewInt(1))
+
+	return new(big.Int).Sub(d, dremainder)
 }
